@@ -9,7 +9,8 @@ declare module 'socket.io' {
   }
 }
 
-const io = new Server(8080, { cors: { origin: '*' } });
+const PORT = Number(process.env.PORT ?? 3000);
+const io = new Server(PORT, { cors: { origin: '*' } });
 
 io.use((socket, next) => {
   socket.userId = crypto.randomUUID();
