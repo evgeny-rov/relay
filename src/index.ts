@@ -1,74 +1,69 @@
+import * as dotenv from 'dotenv';
 import { Server } from 'socket.io';
+import { createClient } from 'redis';
 import crypto from 'crypto';
-import { getRandomHostId } from './uuid';
 
-interface Session {
-  token: string;
-  id: string;
-  active: boolean;
-}
+dotenv.config();
 
 declare module 'socket.io' {
   interface Socket {
-    userId: string;
-    session: Session;
+    session: {
+      token: string;
+      userId: string;
+    };
   }
 }
 
-const sessions = new Map<string, Session>();
+const IO_PORT = Number(process.env.PORT ?? 8080);
 
-const PORT = Number(process.env.PORT ?? 8080);
-const io = new Server(PORT, { cors: { origin: '*' } });
+const randomNanoId = (
+  len: number,
+  source = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_'
+) => {
+  return Array(len)
+    .fill(null)
+    .map(() => source[Math.floor(Math.random() * source.length)])
+    .join('');
+};
 
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-  const session = sessions.get(token);
+const redis = createClient({
+  url: process.env.REDIS_URL,
+});
 
-  if (session) {
-    socket.session = session;
-    session.active = true;
+redis.on('error', (err) => console.log('Could not establish a connection with redis. ' + err));
+redis.connect();
+
+const io = new Server(IO_PORT, { cors: { origin: '*' } });
+
+io.use(async (socket, next) => {
+  const sessionToken = socket.handshake.auth.sessionToken;
+  const userId = sessionToken && (await redis.get(sessionToken));
+
+  if (sessionToken && userId) {
+    redis.persist(sessionToken);
+    socket.session = { token: sessionToken, userId };
+  } else {
+    const newToken = crypto.randomUUID();
+    const newUserId = randomNanoId(7);
+    socket.session = { token: newToken, userId: newUserId };
+    redis.set(newToken, newUserId);
   }
 
-  socket.userId = crypto.randomUUID();
   next();
 });
 
 io.on('connection', (socket) => {
-  const session = socket.session;
+  socket.join(socket.session.userId);
+  socket.emit('session', socket.session);
 
-  if (session) {
-    socket.leave(socket.userId);
-    socket.join(socket.session.id);
-  } else {
-    socket.join(socket.userId);
-
-    socket.on('host', () => {
-      const session = { id: getRandomHostId(), token: crypto.randomUUID(), active: true };
-      socket.session = session;
-
-      sessions.set(session.token, session);
-
-      socket.leave(socket.userId);
-      socket.join(session.id);
-      socket.emit('host:promoted', { hostId: session.id, token: session.token });
-    });
-  }
-
-  socket.on('peer', ({ type, to, data }) => {
-    socket.to(to).emit('peer', { type, from: socket.userId, data });
+  socket.on('direct', ({ type, to, data }) => {
+    socket.to(to).emit('direct', { type, from: socket.session.userId, data });
   });
 
-  socket.on('disconnect', () => {
-    if (!socket.session) return;
-
-    socket.session.active = false;
-
-    // fire cleanup event after 10 minutes
-    setTimeout(() => {
-      if (socket.session.active) return;
-      sessions.delete(socket.session.token);
-    }, 1000 * 60 * 10);
+  socket.on('disconnect', async () => {
+    // expire session after 20 minutes
+    await redis.expire(socket.session.token, 60 * 20);
   });
 });
 
-console.log('started on port 8080');
+console.log(`LISTENING ON PORT: ${IO_PORT}`);
